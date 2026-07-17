@@ -120,3 +120,45 @@ sudo rm -f /etc/nginx/conf.d/habits-agent.conf && sudo systemctl reload nginx
 ```bash
 CGO_ENABLED=0 go build -ldflags '-s -w' -o habits-agent .
 ```
+
+---
+
+## habits-files-agent — страница «My Files»
+
+Отдельный агент для доступа к файлам домашней машины из приложения. Держит
+исходящий WebSocket к бэкенду (внешний IP не нужен) и работает только с
+указанными папками: `ro` — только чтение, `rw` — чтение и запись. Выход за
+пределы папок (в т.ч. через `..` и симлинки) запрещён. Исходники — в
+каталоге `files-agent/`.
+
+### Установка
+
+Токен и папки выдаёт приложение: **My Files → ＋ Добавить машину**.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/resagera/habits-agent/main/install-files.sh \
+  | sudo bash -s -- <ТОКЕН> "/home/me/media:ro;/home/me/box:rw"
+```
+
+Агент по умолчанию запускается от имени пользователя, вызвавшего `sudo`
+(он должен иметь доступ к папкам) — переопределяется флагом `--user`.
+
+### Переменные окружения
+
+- `FILES_AGENT_URL` — endpoint бэкенда (`wss://…/api/v1/files/agent`)
+- `FILES_AGENT_TOKEN` — токен машины
+- `FILES_AGENT_ROOTS` — папки `путь:режим` через `;` (режим `ro`|`rw`)
+
+### Удаление
+
+```bash
+sudo systemctl disable --now habits-files-agent
+sudo rm /usr/local/bin/habits-files-agent /etc/habits-files-agent.env \
+  /etc/systemd/system/habits-files-agent.service
+```
+
+### Сборка вручную
+
+```bash
+cd files-agent && CGO_ENABLED=0 go build -ldflags '-s -w' -o habits-files-agent .
+```
