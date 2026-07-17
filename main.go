@@ -2,11 +2,19 @@
 // Отдаёт GET /metrics с JSON: ОС, внешний IP, диски, RAM, CPU, uptime.
 // Только stdlib и /proc (Linux). Защита — токен в Authorization: Bearer.
 //
-// Запуск: AGENT_TOKEN=secret ./habits-agent  (слушает :9101)
+// Два режима (можно совмещать):
+//   - pull (по умолчанию): слушает AGENT_ADDR (:9101), бэкенд опрашивает сам;
+//   - push (для машин без внешнего IP): при заданном AGENT_PUSH_URL сам шлёт
+//     отчёт раз в AGENT_PUSH_INTERVAL (60s) с AGENT_TOKEN как Bearer.
+//     HTTP-сервер в push-режиме поднимается, только если AGENT_ADDR задан явно.
+//
+// Запуск: AGENT_TOKEN=secret ./habits-agent
+//    или: AGENT_TOKEN=<push-токен> AGENT_PUSH_URL=https://…/api/v1/agent/push ./habits-agent
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"io"
@@ -50,10 +58,25 @@ type Report struct {
 
 func main() {
 	addr := os.Getenv("AGENT_ADDR")
+	token := os.Getenv("AGENT_TOKEN")
+	pushURL := os.Getenv("AGENT_PUSH_URL")
+
+	if pushURL != "" {
+		interval := 60 * time.Second
+		if raw := os.Getenv("AGENT_PUSH_INTERVAL"); raw != "" {
+			if d, err := time.ParseDuration(raw); err == nil && d >= 10*time.Second {
+				interval = d
+			}
+		}
+		go pushLoop(pushURL, token, interval)
+		if addr == "" {
+			select {} // push-only: порт не занимаем
+		}
+	}
+
 	if addr == "" {
 		addr = ":9101"
 	}
-	token := os.Getenv("AGENT_TOKEN")
 	if token == "" {
 		log.Println("WARN: AGENT_TOKEN is empty — metrics are public")
 	}
@@ -73,6 +96,43 @@ func main() {
 	log.Printf("habits-agent listening on %s", addr)
 	srv := &http.Server{Addr: addr, ReadHeaderTimeout: 5 * time.Second}
 	log.Fatal(srv.ListenAndServe())
+}
+
+// pushLoop раз в interval отправляет отчёт на бэкенд (режим для машин
+// без внешнего IP). Ошибки не фатальны — следующий тик всё исправит.
+func pushLoop(url, token string, interval time.Duration) {
+	log.Printf("habits-agent: push mode, %s every %s", url, interval)
+	client := &http.Client{Timeout: 15 * time.Second}
+	send := func() {
+		body, err := json.Marshal(collect())
+		if err != nil {
+			log.Printf("push: marshal: %v", err)
+			return
+		}
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			log.Printf("push: request: %v", err)
+			return
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Printf("push: %v", err)
+			return
+		}
+		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		resp.Body.Close()
+		if resp.StatusCode >= 300 {
+			log.Printf("push: server replied %s", resp.Status)
+		}
+	}
+	send()
+	for range time.Tick(interval) {
+		send()
+	}
 }
 
 func collect() Report {
