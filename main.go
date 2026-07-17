@@ -102,7 +102,13 @@ func main() {
 // без внешнего IP). Ошибки не фатальны — следующий тик всё исправит.
 func pushLoop(url, token string, interval time.Duration) {
 	log.Printf("habits-agent: push mode, %s every %s", url, interval)
-	client := &http.Client{Timeout: 15 * time.Second}
+	// Без keep-alive: раз в минуту дешевле открыть новое соединение, чем
+	// зависнуть на «полумёртвом» HTTP/2-коннекте (NAT/рестарт прокси убивают
+	// его молча, а Go продолжает слать запросы в мёртвый канал до таймаута).
+	client := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true},
+	}
 	send := func() {
 		body, err := json.Marshal(collect())
 		if err != nil {

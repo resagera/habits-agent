@@ -50,7 +50,7 @@ elif command -v go >/dev/null 2>&1 && [[ -f "$SCRIPT_DIR/main.go" ]]; then
     (cd "$SCRIPT_DIR" && CGO_ENABLED=0 go build -ldflags '-s -w' -o /usr/local/bin/habits-agent .)
 else
     echo "    скачиваю релиз с GitHub"
-    ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; esac
+    ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; armv6l|armv7l) ARCH=arm ;; esac
     curl -fsSL "https://github.com/$REPO/releases/latest/download/habits-agent-linux-$ARCH" \
         -o /usr/local/bin/habits-agent
     chmod 755 /usr/local/bin/habits-agent
