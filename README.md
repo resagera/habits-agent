@@ -162,3 +162,41 @@ sudo rm /usr/local/bin/habits-files-agent /etc/habits-files-agent.env \
 ```bash
 cd files-agent && CGO_ENABLED=0 go build -ldflags '-s -w' -o habits-files-agent .
 ```
+
+---
+
+## habits-term-agent — страница Terminal
+
+Shell-агент для веб-консоли к домашней машине из приложения. Держит исходящий
+WebSocket к бэкенду (внешний IP не нужен) и по запросу открывает PTY-сессии.
+Исходники — в каталоге `term-agent/`.
+
+**⚠️ Даёт полный доступ к shell** под пользователем, от которого запущен.
+Ставьте только на свои машины, храните токен в секрете.
+
+### Установка
+
+Токен выдаёт приложение: **Terminal → ＋ Добавить машину**.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/resagera/habits-agent/main/install-term.sh \
+  | sudo bash -s -- <ТОКЕН>
+```
+
+Агент по умолчанию запускается от имени пользователя, вызвавшего `sudo`
+(его shell и права) — переопределяется `--user`; стартовый каталог — `--dir`.
+
+### Переменные окружения
+
+- `TERM_AGENT_URL` — endpoint бэкенда (`wss://…/api/v1/terminal/agent`)
+- `TERM_AGENT_TOKEN` — токен машины
+- `TERM_AGENT_SHELL` — shell (по умолчанию `$SHELL` или `/bin/bash`)
+- `TERM_AGENT_DIR` — стартовый каталог (по умолчанию `$HOME`)
+
+### Удаление
+
+```bash
+sudo systemctl disable --now habits-term-agent
+sudo rm /usr/local/bin/habits-term-agent /etc/habits-term-agent.env \
+  /etc/systemd/system/habits-term-agent.service
+```

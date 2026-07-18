@@ -2,4 +2,7 @@ habits-agent
 habits-agent-linux-*
 habits-files-agent
 habits-files-agent-linux-*
+habits-term-agent
+habits-term-agent-linux-*
 files-agent/habits-files-agent
+term-agent/habits-term-agent
