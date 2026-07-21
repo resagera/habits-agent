@@ -14,6 +14,7 @@ TOKEN="${1:-}"
 URL="wss://telegram.resager.ru/app/habits/api/v1/automation/agent"
 RUN_USER="${SUDO_USER:-root}"
 REPO="resagera/habits-agent"
+RELEASE_TAG="automation-v1.0.0" # пин: у репо общий latest на другой агент
 
 if [[ -z "$TOKEN" || "$TOKEN" == --* ]]; then
     echo "Использование: $0 <TOKEN> [--url URL] [--user ИМЯ]"
@@ -44,9 +45,9 @@ elif command -v go >/dev/null 2>&1 && [[ -f "$SCRIPT_DIR/automation-agent/main.g
     echo "    сборка из исходников (go build)"
     (cd "$SCRIPT_DIR/automation-agent" && CGO_ENABLED=0 go build -ldflags '-s -w' -o /usr/local/bin/habits-automation-agent .)
 else
-    echo "    скачиваю релиз с GitHub"
+    echo "    скачиваю релиз с GitHub ($RELEASE_TAG)"
     ARCH=$(uname -m); case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; armv6l|armv7l) ARCH=arm ;; esac
-    curl -fsSL "https://github.com/$REPO/releases/latest/download/habits-automation-agent-linux-$ARCH" \
+    curl -fsSL "https://github.com/$REPO/releases/download/$RELEASE_TAG/habits-automation-agent-linux-$ARCH" \
         -o /usr/local/bin/habits-automation-agent
     chmod 755 /usr/local/bin/habits-automation-agent
 fi
