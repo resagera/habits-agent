@@ -46,7 +46,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const agentVersion = "1.2.0"
+const agentVersion = "1.3.0"
 
 var httpClient = &http.Client{Timeout: 20 * time.Second}
 
@@ -96,6 +96,14 @@ var (
 
 	// не больше двух прогонов одновременно
 	runSem = make(chan struct{}, 2)
+
+	// принятые/выполняющиеся прогоны: дедуп повторной доставки (сервер
+	// дошлёт очередь на reconnect — процесс-то мог и не перезапускаться)
+	// + отмена (canceled) и kill работающего процесса
+	runsMu   sync.Mutex
+	accepted = map[int64]bool{}
+	canceled = map[int64]bool{}
+	killers  = map[int64]func(){} // runID -> отмена контекста процесса
 )
 
 // sendCurrent шлёт кадр через актуальное соединение (если оно есть).
@@ -272,11 +280,35 @@ func (c *conn) loop() error {
 				_ = c.send(frame{Kind: "resp", ID: f.ID, OK: true, Result: res})
 			}(f)
 		case "run":
+			runsMu.Lock()
+			dup := accepted[f.RunID]
+			if !dup {
+				accepted[f.RunID] = true
+			}
+			runsMu.Unlock()
+			if dup { // повторная доставка (redelivery после reconnect)
+				continue
+			}
 			go run(f)
+		case "cancel":
+			runsMu.Lock()
+			canceled[f.RunID] = true
+			kill := killers[f.RunID]
+			runsMu.Unlock()
+			if kill != nil {
+				log.Printf("run %d: cancel — killing process", f.RunID)
+				kill()
+			} else {
+				log.Printf("run %d: cancel noted", f.RunID)
+			}
 		case "run_ack":
 			resultsMu.Lock()
 			delete(results, f.RunID)
 			resultsMu.Unlock()
+			runsMu.Lock()
+			delete(accepted, f.RunID)
+			delete(canceled, f.RunID)
+			runsMu.Unlock()
 		}
 	}
 }
@@ -578,6 +610,25 @@ func codexLimitsFromFile(path string) (usageInfo, bool) {
 
 // --- прогоны ---
 
+func registerKiller(runID int64, cancel func()) {
+	runsMu.Lock()
+	killers[runID] = cancel
+	runsMu.Unlock()
+}
+
+func unregisterKiller(runID int64) {
+	runsMu.Lock()
+	delete(killers, runID)
+	runsMu.Unlock()
+}
+
+// runCanceled — прерван ли прогон пользователем (а не таймаутом).
+func runCanceled(runID int64) bool {
+	runsMu.Lock()
+	defer runsMu.Unlock()
+	return canceled[runID]
+}
+
 func dirAllowed(workdir string) bool {
 	wd := filepath.Clean(workdir)
 	for _, d := range dirs {
@@ -594,7 +645,16 @@ func run(f frame) {
 	runSem <- struct{}{}
 	defer func() { <-runSem }()
 
-	result := execute(f)
+	// отменили, пока ждали очередь семафора — не запускаем вовсе
+	runsMu.Lock()
+	wasCanceled := canceled[f.RunID]
+	runsMu.Unlock()
+	var result frame
+	if wasCanceled {
+		result = frame{OK: false, Error: "остановлено пользователем"}
+	} else {
+		result = execute(f)
+	}
 	result.Kind = "run_result"
 	result.RunID = f.RunID
 	resultsMu.Lock()
@@ -642,6 +702,8 @@ func executeClaude(f frame) frame {
 
 	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
 	defer cancel()
+	registerKiller(f.RunID, cancel)
+	defer unregisterKiller(f.RunID)
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = f.Workdir
 	cmd.Stdin = strings.NewReader(f.Prompt)
@@ -692,6 +754,9 @@ func executeClaude(f frame) frame {
 		msg = firstNonEmpty(msg, runErr.Error())
 		if ctx.Err() != nil {
 			msg = "таймаут прогона (" + runTimeout.String() + ")"
+			if runCanceled(f.RunID) {
+				msg = "остановлено пользователем"
+			}
 		}
 	}
 	log.Printf("run %d: failed after %s: %s", f.RunID, elapsed, truncate(msg, 200))
@@ -726,6 +791,8 @@ func executeCodex(f frame) frame {
 
 	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
 	defer cancel()
+	registerKiller(f.RunID, cancel)
+	defer unregisterKiller(f.RunID)
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = f.Workdir
 	cmd.Stdin = strings.NewReader(f.Prompt)
@@ -797,6 +864,9 @@ func executeCodex(f frame) frame {
 			msg = firstNonEmpty(msg, runErr.Error())
 			if ctx.Err() != nil {
 				msg = "таймаут прогона (" + runTimeout.String() + ")"
+				if runCanceled(f.RunID) {
+					msg = "остановлено пользователем"
+				}
 			}
 		}
 		if msg == "" {
