@@ -29,6 +29,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -46,7 +47,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const agentVersion = "1.3.0"
+const agentVersion = "1.4.0"
 
 var httpClient = &http.Client{Timeout: 20 * time.Second}
 
@@ -67,6 +68,7 @@ type frame struct {
 	Model     string          `json:"model,omitempty"`
 	Params    string          `json:"params,omitempty"`
 	Prompt    string          `json:"prompt,omitempty"`
+	Mode      string          `json:"mode,omitempty"` // '' | 'plan'
 	SessionID string          `json:"session_id,omitempty"`
 	Status    string          `json:"status,omitempty"`
 	Output    string          `json:"output,omitempty"`
@@ -682,14 +684,38 @@ func execute(f frame) frame {
 	}
 }
 
+// sendLog — строка живого лога (best-effort: потеря не критична, финальный
+// результат идёт надёжным путём run_result).
+func sendLog(runID int64, line string) {
+	_ = sendCurrent(frame{Kind: "run_log", RunID: runID, Output: line})
+}
+
+// toolSummary — короткая подпись входа инструмента для строки лога.
+func toolSummary(input json.RawMessage) string {
+	var m map[string]any
+	if json.Unmarshal(input, &m) != nil {
+		return ""
+	}
+	for _, k := range []string{"command", "file_path", "path", "pattern", "url", "prompt", "description", "query"} {
+		if v, ok := m[k].(string); ok && v != "" {
+			return truncate(strings.Join(strings.Fields(v), " "), 140)
+		}
+	}
+	return ""
+}
+
 func executeClaude(f frame) frame {
 	bin, err := exec.LookPath(claudeBin)
 	if err != nil {
 		return frame{OK: false, Error: "claude не найден в PATH"}
 	}
 
-	args := []string{"-p", "--output-format", "json"}
-	if bypass {
+	// stream-json (+обязательный --verbose) — события хода выполнения на лету
+	args := []string{"-p", "--output-format", "stream-json", "--verbose"}
+	if f.Mode == "plan" {
+		// режим «только план»: без правок файлов; bypass не добавляем
+		args = append(args, "--permission-mode", "plan")
+	} else if bypass {
 		args = append(args, "--dangerously-skip-permissions")
 	}
 	if f.Model != "" {
@@ -707,14 +733,77 @@ func executeClaude(f frame) frame {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = f.Workdir
 	cmd.Stdin = strings.NewReader(f.Prompt)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return frame{OK: false, Error: err.Error()}
+	}
 
-	log.Printf("run %d: claude in %s (model=%q resume=%v)", f.RunID, f.Workdir, f.Model, f.SessionID != "")
+	log.Printf("run %d: claude in %s (model=%q resume=%v mode=%q)", f.RunID, f.Workdir, f.Model, f.SessionID != "", f.Mode)
 	_ = sendCurrent(frame{Kind: "run_status", RunID: f.RunID, Status: "running"})
 	start := time.Now()
-	runErr := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return frame{OK: false, Error: err.Error()}
+	}
+
+	// потоковый разбор JSONL: события → живой лог, финальный result → итог
+	var res struct {
+		IsError      bool    `json:"is_error"`
+		Result       string  `json:"result"`
+		SessionID    string  `json:"session_id"`
+		TotalCostUSD float64 `json:"total_cost_usd"`
+		NumTurns     int     `json:"num_turns"`
+		Subtype      string  `json:"subtype"`
+	}
+	gotResult := false
+	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	for sc.Scan() {
+		line := sc.Bytes()
+		var ev struct {
+			Type    string `json:"type"`
+			Message struct {
+				Content []struct {
+					Type  string          `json:"type"`
+					Name  string          `json:"name"`
+					Text  string          `json:"text"`
+					Input json.RawMessage `json:"input"`
+				} `json:"content"`
+			} `json:"message"`
+			IsError      bool    `json:"is_error"`
+			Result       string  `json:"result"`
+			SessionID    string  `json:"session_id"`
+			TotalCostUSD float64 `json:"total_cost_usd"`
+			NumTurns     int     `json:"num_turns"`
+			Subtype      string  `json:"subtype"`
+		}
+		if json.Unmarshal(line, &ev) != nil {
+			continue
+		}
+		switch ev.Type {
+		case "assistant":
+			for _, b := range ev.Message.Content {
+				switch b.Type {
+				case "tool_use":
+					s := toolSummary(b.Input)
+					if s != "" {
+						s = ": " + s
+					}
+					sendLog(f.RunID, "🔧 "+b.Name+s)
+				case "text":
+					if t := strings.TrimSpace(b.Text); t != "" {
+						sendLog(f.RunID, "💬 "+truncate(strings.Join(strings.Fields(t), " "), 160))
+					}
+				}
+			}
+		case "result":
+			res.IsError, res.Result, res.SessionID = ev.IsError, ev.Result, ev.SessionID
+			res.TotalCostUSD, res.NumTurns, res.Subtype = ev.TotalCostUSD, ev.NumTurns, ev.Subtype
+			gotResult = true
+		}
+	}
+	runErr := cmd.Wait()
 	elapsed := time.Since(start)
 
 	meta := map[string]any{"elapsed_sec": int(elapsed.Seconds())}
@@ -725,31 +814,22 @@ func executeClaude(f frame) frame {
 		}
 	}
 
-	// разбор JSON print-режима: result, session_id, стоимость и т.п.
-	var out struct {
-		IsError      bool    `json:"is_error"`
-		Result       string  `json:"result"`
-		SessionID    string  `json:"session_id"`
-		TotalCostUSD float64 `json:"total_cost_usd"`
-		NumTurns     int     `json:"num_turns"`
-		Subtype      string  `json:"subtype"`
-	}
-	if err := json.Unmarshal(stdout.Bytes(), &out); err == nil && out.SessionID != "" {
-		meta["cost_usd"] = out.TotalCostUSD
-		meta["num_turns"] = out.NumTurns
+	if gotResult && res.SessionID != "" {
+		meta["cost_usd"] = res.TotalCostUSD
+		meta["num_turns"] = res.NumTurns
 		mb, _ := json.Marshal(meta)
-		if out.IsError || (runErr != nil && out.Result == "") {
-			log.Printf("run %d: error after %s (%s)", f.RunID, elapsed, out.Subtype)
-			return frame{OK: false, Error: truncate(firstNonEmpty(out.Result, stderr.String(), out.Subtype), 16_000),
-				SessionID: out.SessionID, Meta: mb}
+		if res.IsError || (runErr != nil && res.Result == "") {
+			log.Printf("run %d: error after %s (%s)", f.RunID, elapsed, res.Subtype)
+			return frame{OK: false, Error: truncate(firstNonEmpty(res.Result, stderr.String(), res.Subtype), 16_000),
+				SessionID: res.SessionID, Meta: mb}
 		}
-		log.Printf("run %d: done in %s (turns=%d, cost=$%.4f)", f.RunID, elapsed, out.NumTurns, out.TotalCostUSD)
-		return frame{OK: true, Output: truncate(out.Result, 512_000), SessionID: out.SessionID, Meta: mb}
+		log.Printf("run %d: done in %s (turns=%d, cost=$%.4f)", f.RunID, elapsed, res.NumTurns, res.TotalCostUSD)
+		return frame{OK: true, Output: truncate(res.Result, 512_000), SessionID: res.SessionID, Meta: mb}
 	}
 
-	// JSON не распарсился — вернуть сырой вывод как ошибку
+	// финального события нет (kill/таймаут/сбой) — ошибка из stderr
 	mb, _ := json.Marshal(meta)
-	msg := firstNonEmpty(strings.TrimSpace(stderr.String()), strings.TrimSpace(stdout.String()))
+	msg := strings.TrimSpace(stderr.String())
 	if runErr != nil {
 		msg = firstNonEmpty(msg, runErr.Error())
 		if ctx.Err() != nil {
@@ -778,7 +858,10 @@ func executeCodex(f frame) frame {
 	}
 	// --skip-git-repo-check: разрешённая папка не обязана быть git-репо
 	args = append(args, "--json", "--skip-git-repo-check")
-	if bypass {
+	if f.Mode == "plan" {
+		// режим «только план»: чтение без правок; bypass не добавляем
+		args = append(args, "--sandbox", "read-only")
+	} else if bypass {
 		args = append(args, "--dangerously-bypass-approvals-and-sandbox")
 	} else {
 		args = append(args, "--sandbox", "workspace-write")
@@ -796,14 +879,62 @@ func executeCodex(f frame) frame {
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.Dir = f.Workdir
 	cmd.Stdin = strings.NewReader(f.Prompt)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
+	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return frame{OK: false, Error: err.Error()}
+	}
 
-	log.Printf("run %d: codex in %s (model=%q resume=%v)", f.RunID, f.Workdir, f.Model, f.SessionID != "")
+	log.Printf("run %d: codex in %s (model=%q resume=%v mode=%q)", f.RunID, f.Workdir, f.Model, f.SessionID != "", f.Mode)
 	_ = sendCurrent(frame{Kind: "run_status", RunID: f.RunID, Status: "running"})
 	start := time.Now()
-	runErr := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return frame{OK: false, Error: err.Error()}
+	}
+
+	// потоковый разбор JSONL: события → живой лог + финальные данные
+	var threadID, lastMsg string
+	var turns int
+	var inTok, outTok int64
+	sc := bufio.NewScanner(stdout)
+	sc.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	for sc.Scan() {
+		var ev struct {
+			Type     string `json:"type"`
+			ThreadID string `json:"thread_id"`
+			Item     struct {
+				Type    string `json:"type"`
+				Text    string `json:"text"`
+				Command string `json:"command"`
+			} `json:"item"`
+			Usage struct {
+				InputTokens  int64 `json:"input_tokens"`
+				OutputTokens int64 `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal(sc.Bytes(), &ev) != nil {
+			continue
+		}
+		switch ev.Type {
+		case "thread.started":
+			threadID = ev.ThreadID
+		case "item.started":
+			if ev.Item.Type == "command_execution" && ev.Item.Command != "" {
+				sendLog(f.RunID, "🔧 "+truncate(strings.Join(strings.Fields(ev.Item.Command), " "), 140))
+			}
+		case "item.completed":
+			if ev.Item.Type == "agent_message" && ev.Item.Text != "" {
+				lastMsg = ev.Item.Text
+				sendLog(f.RunID, "💬 "+truncate(strings.Join(strings.Fields(ev.Item.Text), " "), 160))
+			}
+		case "turn.completed":
+			turns++
+			inTok += ev.Usage.InputTokens
+			outTok += ev.Usage.OutputTokens
+		}
+	}
+	runErr := cmd.Wait()
 	elapsed := time.Since(start)
 
 	meta := map[string]any{"elapsed_sec": int(elapsed.Seconds())}
@@ -811,44 +942,6 @@ func executeCodex(f frame) frame {
 		meta["branch"] = branch
 		if diffstat != "" {
 			meta["diffstat"] = diffstat
-		}
-	}
-
-	// разбор JSONL: thread_id, сообщения агента, usage последнего хода
-	var threadID, lastMsg string
-	var turns int
-	var inTok, outTok int64
-	for _, line := range strings.Split(stdout.String(), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		var ev struct {
-			Type     string `json:"type"`
-			ThreadID string `json:"thread_id"`
-			Item     struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"item"`
-			Usage struct {
-				InputTokens  int64 `json:"input_tokens"`
-				OutputTokens int64 `json:"output_tokens"`
-			} `json:"usage"`
-		}
-		if json.Unmarshal([]byte(line), &ev) != nil {
-			continue
-		}
-		switch ev.Type {
-		case "thread.started":
-			threadID = ev.ThreadID
-		case "item.completed":
-			if ev.Item.Type == "agent_message" && ev.Item.Text != "" {
-				lastMsg = ev.Item.Text
-			}
-		case "turn.completed":
-			turns++
-			inTok += ev.Usage.InputTokens
-			outTok += ev.Usage.OutputTokens
 		}
 	}
 	if turns > 0 {
