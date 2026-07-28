@@ -44,7 +44,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const agentVersion = "1.0.0"
+const agentVersion = "1.0.1"
 const defaultURL = "wss://telegram.resager.ru/app/habits/api/v1/ai/agent"
 
 type frame struct {
@@ -76,13 +76,51 @@ var (
 	claudeBin  = "claude"
 	runTimeout = 60 * time.Minute
 
-	// неподтверждённые результаты: run_id -> кадр (повтор после reconnect)
+	// неподтверждённые результаты: run_id -> кадр (повтор после reconnect
+	// и периодическим дослива-флашером)
 	resultsMu sync.Mutex
 	results   = map[int64]frame{}
+
+	// текущее живое соединение: горутина прогона могла пережить reconnect,
+	// поэтому шлёт через него, а не через соединение времени своего старта
+	curMu sync.RWMutex
+	cur   *conn
 
 	// не больше двух прогонов одновременно
 	runSem = make(chan struct{}, 2)
 )
+
+// sendCurrent шлёт кадр через актуальное соединение (если оно есть).
+func sendCurrent(f frame) error {
+	curMu.RLock()
+	c := cur
+	curMu.RUnlock()
+	if c == nil {
+		return errNoConn
+	}
+	return c.send(f)
+}
+
+var errNoConn = os.ErrClosed
+
+// flusher периодически дошлёт неподтверждённые результаты: покрывает случай
+// «результат готов, соединение уже новое» и «отправили, но сервер не сохранил
+// (нет run_ack)». Сервер идемпотентен, повтор безопасен.
+func flusher() {
+	for range time.Tick(30 * time.Second) {
+		resultsMu.Lock()
+		pending := make([]frame, 0, len(results))
+		for _, f := range results {
+			pending = append(pending, f)
+		}
+		resultsMu.Unlock()
+		for _, f := range pending {
+			if err := sendCurrent(f); err == nil {
+				log.Printf("run %d: result re-sent", f.RunID)
+			}
+		}
+	}
+}
 
 func main() {
 	wsURL := os.Getenv("AI_AGENT_URL")
@@ -120,6 +158,8 @@ func main() {
 		log.Printf("dir %s", d)
 	}
 	log.Printf("bypass=%v timeout=%s", bypass, runTimeout)
+
+	go flusher()
 
 	backoff := time.Second
 	for {
@@ -159,8 +199,17 @@ func connect(wsURL, token string) error {
 	}
 	defer ws.Close()
 	c := &conn{ws: ws}
+	curMu.Lock()
+	cur = c
+	curMu.Unlock()
 	log.Printf("connected to %s", wsURL)
-	return c.loop()
+	err = c.loop()
+	curMu.Lock()
+	if cur == c {
+		cur = nil
+	}
+	curMu.Unlock()
+	return err
 }
 
 func (c *conn) loop() error {
@@ -210,7 +259,7 @@ func (c *conn) loop() error {
 				_ = c.send(frame{Kind: "resp", ID: f.ID, OK: true, Result: res})
 			}(f)
 		case "run":
-			go c.run(f)
+			go run(f)
 		case "run_ack":
 			resultsMu.Lock()
 			delete(results, f.RunID)
@@ -315,22 +364,24 @@ func dirAllowed(workdir string) bool {
 	return false
 }
 
-func (c *conn) run(f frame) {
+// run выполняется в горутине и может пережить reconnect — все отправки идут
+// через sendCurrent (актуальное соединение), а не через соединение старта.
+func run(f frame) {
 	runSem <- struct{}{}
 	defer func() { <-runSem }()
 
-	result := c.execute(f)
+	result := execute(f)
 	result.Kind = "run_result"
 	result.RunID = f.RunID
 	resultsMu.Lock()
 	results[f.RunID] = result
 	resultsMu.Unlock()
-	if err := c.send(result); err != nil {
-		log.Printf("run %d: send result failed (queued for resend): %v", f.RunID, err)
+	if err := sendCurrent(result); err != nil {
+		log.Printf("run %d: send result failed (flusher re-sends): %v", f.RunID, err)
 	}
 }
 
-func (c *conn) execute(f frame) frame {
+func execute(f frame) frame {
 	if f.Tool != "claude" {
 		return frame{OK: false, Error: "инструмент не поддерживается: " + f.Tool}
 	}
@@ -367,7 +418,7 @@ func (c *conn) execute(f frame) frame {
 	cmd.Stderr = &stderr
 
 	log.Printf("run %d: claude in %s (model=%q resume=%v)", f.RunID, f.Workdir, f.Model, f.SessionID != "")
-	_ = c.send(frame{Kind: "run_status", RunID: f.RunID, Status: "running"})
+	_ = sendCurrent(frame{Kind: "run_status", RunID: f.RunID, Status: "running"})
 	start := time.Now()
 	runErr := cmd.Run()
 	elapsed := time.Since(start)
