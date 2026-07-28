@@ -44,7 +44,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const agentVersion = "1.0.1"
+const agentVersion = "1.1.0"
 const defaultURL = "wss://telegram.resager.ru/app/habits/api/v1/ai/agent"
 
 type frame struct {
@@ -342,12 +342,23 @@ func checkCodex() toolStatus {
 	if out, err := exec.CommandContext(ctx, bin, "--version").Output(); err == nil {
 		st.Version = strings.TrimSpace(string(out))
 	}
-	// эвристика: наличие файла авторизации (запуск задач для codex пока не реализован)
-	home, _ := os.UserHomeDir()
-	if _, err := os.Stat(filepath.Join(home, ".codex", "auth.json")); err == nil {
+	// авторизация: реальный мини-запрос (как у claude) — единственный
+	// надёжный способ; --ephemeral, чтобы не плодить сессии
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 75*time.Second)
+	defer cancel2()
+	cmd := exec.CommandContext(ctx2, bin, "exec", "--json", "--skip-git-repo-check", "--ephemeral", "-")
+	cmd.Dir = dirs[0]
+	cmd.Stdin = strings.NewReader("Reply with exactly: ok")
+	out, err := cmd.Output()
+	if err == nil && strings.Contains(string(out), `"agent_message"`) {
 		st.Authorized = true
 	} else {
 		st.Error = "codex установлен, но не авторизован — выполните на машине: codex login"
+		if err != nil {
+			if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
+				st.Error += " · " + truncate(string(ee.Stderr), 300)
+			}
+		}
 	}
 	return st
 }
@@ -382,15 +393,23 @@ func run(f frame) {
 }
 
 func execute(f frame) frame {
-	if f.Tool != "claude" {
-		return frame{OK: false, Error: "инструмент не поддерживается: " + f.Tool}
-	}
 	if !dirAllowed(f.Workdir) {
 		return frame{OK: false, Error: "папка вне белого списка агента: " + f.Workdir}
 	}
 	if st, err := os.Stat(f.Workdir); err != nil || !st.IsDir() {
 		return frame{OK: false, Error: "папка не существует: " + f.Workdir}
 	}
+	switch f.Tool {
+	case "claude":
+		return executeClaude(f)
+	case "codex":
+		return executeCodex(f)
+	default:
+		return frame{OK: false, Error: "инструмент не поддерживается: " + f.Tool}
+	}
+}
+
+func executeClaude(f frame) frame {
 	bin, err := exec.LookPath(claudeBin)
 	if err != nil {
 		return frame{OK: false, Error: "claude не найден в PATH"}
@@ -466,6 +485,117 @@ func execute(f frame) frame {
 	return frame{OK: false, Error: truncate(msg, 16_000), Meta: mb}
 }
 
+// executeCodex — прогон через Codex CLI (`codex exec`, JSONL-события).
+// Контекст задачи: thread_id из события thread.started, продолжение —
+// `codex exec resume <id>`. Модель по умолчанию — из config.toml машины.
+func executeCodex(f frame) frame {
+	bin, err := exec.LookPath("codex")
+	if err != nil {
+		return frame{OK: false, Error: "codex не найден в PATH"}
+	}
+
+	args := []string{"exec"}
+	if f.SessionID != "" {
+		args = append(args, "resume", f.SessionID)
+	}
+	// --skip-git-repo-check: разрешённая папка не обязана быть git-репо
+	args = append(args, "--json", "--skip-git-repo-check")
+	if bypass {
+		args = append(args, "--dangerously-bypass-approvals-and-sandbox")
+	} else {
+		args = append(args, "--sandbox", "workspace-write")
+	}
+	if f.Model != "" {
+		args = append(args, "-m", f.Model)
+	}
+	args = append(args, filterParamsCodex(splitArgs(f.Params))...)
+	args = append(args, "-") // промпт через stdin
+
+	ctx, cancel := context.WithTimeout(context.Background(), runTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Dir = f.Workdir
+	cmd.Stdin = strings.NewReader(f.Prompt)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	log.Printf("run %d: codex in %s (model=%q resume=%v)", f.RunID, f.Workdir, f.Model, f.SessionID != "")
+	_ = sendCurrent(frame{Kind: "run_status", RunID: f.RunID, Status: "running"})
+	start := time.Now()
+	runErr := cmd.Run()
+	elapsed := time.Since(start)
+
+	meta := map[string]any{"elapsed_sec": int(elapsed.Seconds())}
+	if branch, diffstat := gitInfo(f.Workdir); branch != "" {
+		meta["branch"] = branch
+		if diffstat != "" {
+			meta["diffstat"] = diffstat
+		}
+	}
+
+	// разбор JSONL: thread_id, сообщения агента, usage последнего хода
+	var threadID, lastMsg string
+	var turns int
+	var inTok, outTok int64
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var ev struct {
+			Type     string `json:"type"`
+			ThreadID string `json:"thread_id"`
+			Item     struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"item"`
+			Usage struct {
+				InputTokens  int64 `json:"input_tokens"`
+				OutputTokens int64 `json:"output_tokens"`
+			} `json:"usage"`
+		}
+		if json.Unmarshal([]byte(line), &ev) != nil {
+			continue
+		}
+		switch ev.Type {
+		case "thread.started":
+			threadID = ev.ThreadID
+		case "item.completed":
+			if ev.Item.Type == "agent_message" && ev.Item.Text != "" {
+				lastMsg = ev.Item.Text
+			}
+		case "turn.completed":
+			turns++
+			inTok += ev.Usage.InputTokens
+			outTok += ev.Usage.OutputTokens
+		}
+	}
+	if turns > 0 {
+		meta["num_turns"] = turns
+		meta["tokens_in"] = inTok
+		meta["tokens_out"] = outTok
+	}
+	mb, _ := json.Marshal(meta)
+
+	if runErr != nil || lastMsg == "" {
+		msg := firstNonEmpty(strings.TrimSpace(stderr.String()), lastMsg)
+		if runErr != nil {
+			msg = firstNonEmpty(msg, runErr.Error())
+			if ctx.Err() != nil {
+				msg = "таймаут прогона (" + runTimeout.String() + ")"
+			}
+		}
+		if msg == "" {
+			msg = "codex не вернул ответ"
+		}
+		log.Printf("run %d: codex failed after %s: %s", f.RunID, elapsed, truncate(msg, 200))
+		return frame{OK: false, Error: truncate(msg, 16_000), SessionID: threadID, Meta: mb}
+	}
+	log.Printf("run %d: codex done in %s (turns=%d)", f.RunID, elapsed, turns)
+	return frame{OK: true, Output: truncate(lastMsg, 512_000), SessionID: threadID, Meta: mb}
+}
+
 // gitInfo — ветка и краткий diffstat рабочей папки (best-effort).
 func gitInfo(dir string) (branch, diffstat string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -510,12 +640,34 @@ func splitArgs(s string) []string {
 	return args
 }
 
-// filterParams выбрасывает флаги, ломающие протокол (формат вывода, сессии).
+// filterParams выбрасывает флаги claude, ломающие протокол (формат вывода,
+// сессии). withValue — флаги, у которых значение идёт следующим аргументом.
 func filterParams(args []string) []string {
 	blocked := map[string]bool{
 		"-p": true, "--print": true, "--output-format": true, "--input-format": true,
 		"--resume": true, "-r": true, "--continue": true, "-c": true, "--session-id": true,
 	}
+	withValue := map[string]bool{
+		"--output-format": true, "--input-format": true, "--resume": true,
+		"-r": true, "--session-id": true,
+	}
+	return filterBlocked(args, blocked, withValue)
+}
+
+// filterParamsCodex — то же для codex exec (--json/-o/-C/-m задаёт агент).
+func filterParamsCodex(args []string) []string {
+	blocked := map[string]bool{
+		"--json": true, "-o": true, "--output-last-message": true,
+		"-C": true, "--cd": true, "-m": true, "--model": true, "-": true,
+	}
+	withValue := map[string]bool{
+		"-o": true, "--output-last-message": true, "-C": true, "--cd": true,
+		"-m": true, "--model": true,
+	}
+	return filterBlocked(args, blocked, withValue)
+}
+
+func filterBlocked(args []string, blocked, withValue map[string]bool) []string {
 	var out []string
 	skipNext := false
 	for _, a := range args {
@@ -528,9 +680,8 @@ func filterParams(args []string) []string {
 			name = a[:i]
 		}
 		if blocked[name] {
-			// у заблокированного флага без '=' значение идёт следующим аргументом
-			if name == a && (name == "--output-format" || name == "--input-format" ||
-				name == "--resume" || name == "-r" || name == "--session-id" || name == "--model") {
+			// значение отдельным аргументом — только если флаг без '=значение'
+			if name == a && withValue[name] {
 				skipNext = true
 			}
 			continue
