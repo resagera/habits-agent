@@ -33,9 +33,11 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -44,7 +46,13 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const agentVersion = "1.1.0"
+const agentVersion = "1.2.0"
+
+var httpClient = &http.Client{Timeout: 20 * time.Second}
+
+func httpNewRequest(ctx context.Context, url string) (*http.Request, error) {
+	return http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+}
 const defaultURL = "wss://telegram.resager.ru/app/habits/api/v1/ai/agent"
 
 type frame struct {
@@ -258,6 +266,11 @@ func (c *conn) loop() error {
 				res := checkTool(f.Tool)
 				_ = c.send(frame{Kind: "resp", ID: f.ID, OK: true, Result: res})
 			}(f)
+		case "usage":
+			go func(f frame) {
+				res := toolUsage(f.Tool)
+				_ = c.send(frame{Kind: "resp", ID: f.ID, OK: true, Result: res})
+			}(f)
 		case "run":
 			go run(f)
 		case "run_ack":
@@ -361,6 +374,206 @@ func checkCodex() toolStatus {
 		}
 	}
 	return st
+}
+
+// --- лимиты (аналог /usage в Claude Code и /status в Codex) ---
+
+type usageWindow struct {
+	Label    string  `json:"label"`
+	Percent  float64 `json:"percent"`
+	ResetsAt string  `json:"resets_at,omitempty"` // RFC3339
+}
+
+type usageInfo struct {
+	Plan      string        `json:"plan,omitempty"`
+	Windows   []usageWindow `json:"windows"`
+	Note      string        `json:"note,omitempty"`
+	Error     string        `json:"error,omitempty"`
+	FetchedAt int64         `json:"fetched_at"`
+}
+
+func toolUsage(tool string) json.RawMessage {
+	var u usageInfo
+	switch tool {
+	case "claude":
+		u = usageClaude()
+	case "codex":
+		u = usageCodex()
+	default:
+		u.Error = "unknown tool"
+	}
+	u.FetchedAt = time.Now().Unix()
+	if u.Windows == nil {
+		u.Windows = []usageWindow{}
+	}
+	b, _ := json.Marshal(u)
+	return b
+}
+
+// usageClaude — тот же источник, что у /usage: OAuth-эндпоинт Anthropic с
+// токеном из ~/.claude/.credentials.json. Токен не покидает машину — наружу
+// уходят только проценты и даты сброса.
+func usageClaude() usageInfo {
+	home, _ := os.UserHomeDir()
+	raw, err := os.ReadFile(filepath.Join(home, ".claude", ".credentials.json"))
+	if err != nil {
+		return usageInfo{Error: "нет ~/.claude/.credentials.json — войдите в Claude Code"}
+	}
+	var creds struct {
+		ClaudeAiOauth struct {
+			AccessToken string `json:"accessToken"`
+		} `json:"claudeAiOauth"`
+	}
+	if json.Unmarshal(raw, &creds) != nil || creds.ClaudeAiOauth.AccessToken == "" {
+		return usageInfo{Error: "не удалось прочитать OAuth-токен Claude Code"}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, _ := httpNewRequest(ctx, "https://api.anthropic.com/api/oauth/usage")
+	req.Header.Set("Authorization", "Bearer "+creds.ClaudeAiOauth.AccessToken)
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return usageInfo{Error: "запрос usage не удался: " + err.Error()}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return usageInfo{Error: "usage: HTTP " + resp.Status}
+	}
+	var out struct {
+		Limits []struct {
+			Kind     string  `json:"kind"`
+			Percent  float64 `json:"percent"`
+			ResetsAt string  `json:"resets_at"`
+			Scope    *struct {
+				Model struct {
+					DisplayName string `json:"display_name"`
+				} `json:"model"`
+			} `json:"scope"`
+		} `json:"limits"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return usageInfo{Error: "usage: некорректный ответ"}
+	}
+	u := usageInfo{}
+	for _, l := range out.Limits {
+		label := l.Kind
+		switch l.Kind {
+		case "session":
+			label = "Сессия (5 ч)"
+		case "weekly_all":
+			label = "Неделя (все модели)"
+		case "weekly_scoped":
+			label = "Неделя"
+			if l.Scope != nil && l.Scope.Model.DisplayName != "" {
+				label = "Неделя (" + l.Scope.Model.DisplayName + ")"
+			}
+		}
+		u.Windows = append(u.Windows, usageWindow{Label: label, Percent: l.Percent, ResetsAt: l.ResetsAt})
+	}
+	// план подписки — из claude auth status
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel2()
+	if bin, err := exec.LookPath(claudeBin); err == nil {
+		if out, err := exec.CommandContext(ctx2, bin, "auth", "status", "--json").Output(); err == nil {
+			var st struct {
+				SubscriptionType string `json:"subscriptionType"`
+			}
+			if json.Unmarshal(out, &st) == nil {
+				u.Plan = st.SubscriptionType
+			}
+		}
+	}
+	return u
+}
+
+// usageCodex — свежего API нет; берём последний снапшот rate_limits из
+// роллаутов сессий (~/.codex/sessions), который Codex пишет при каждом
+// прогоне. В note — время снапшота.
+func usageCodex() usageInfo {
+	home, _ := os.UserHomeDir()
+	files, err := filepath.Glob(filepath.Join(home, ".codex", "sessions", "*", "*", "*", "*.jsonl"))
+	if err != nil || len(files) == 0 {
+		return usageInfo{Error: "нет данных — выполните любую задачу Codex"}
+	}
+	// имена файлов датированы (rollout-YYYY-MM-DDTHH-MM-SS-...), сортировка
+	// по пути = хронология; смотрим с конца, максимум 10 файлов
+	sort.Strings(files)
+	for i, checked := len(files)-1, 0; i >= 0 && checked < 10; i, checked = i-1, checked+1 {
+		if u, ok := codexLimitsFromFile(files[i]); ok {
+			return u
+		}
+	}
+	return usageInfo{Error: "нет данных — выполните любую задачу Codex"}
+}
+
+func codexLimitsFromFile(path string) (usageInfo, bool) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return usageInfo{}, false
+	}
+	type rlWindow struct {
+		UsedPercent   float64 `json:"used_percent"`
+		WindowMinutes int64   `json:"window_minutes"`
+		ResetsAt      int64   `json:"resets_at"`
+	}
+	var last struct {
+		ts string
+		rl struct {
+			Primary   *rlWindow `json:"primary"`
+			Secondary *rlWindow `json:"secondary"`
+			PlanType  string    `json:"plan_type"`
+		}
+	}
+	found := false
+	for _, line := range strings.Split(string(raw), "\n") {
+		if !strings.Contains(line, `"rate_limits"`) {
+			continue
+		}
+		var rec struct {
+			Timestamp string `json:"timestamp"`
+			Payload   struct {
+				RateLimits json.RawMessage `json:"rate_limits"`
+			} `json:"payload"`
+		}
+		if json.Unmarshal([]byte(line), &rec) != nil || len(rec.Payload.RateLimits) == 0 {
+			continue
+		}
+		if json.Unmarshal(rec.Payload.RateLimits, &last.rl) == nil {
+			last.ts = rec.Timestamp
+			found = true
+		}
+	}
+	if !found {
+		return usageInfo{}, false
+	}
+	u := usageInfo{Plan: last.rl.PlanType}
+	add := func(w *rlWindow) {
+		if w == nil {
+			return
+		}
+		label := "Окно"
+		switch {
+		case w.WindowMinutes >= 10080:
+			label = "Неделя"
+		case w.WindowMinutes >= 240 && w.WindowMinutes <= 360:
+			label = "5 часов"
+		case w.WindowMinutes > 0:
+			label = strconv.FormatInt(w.WindowMinutes/60, 10) + " ч"
+		}
+		var resets string
+		if w.ResetsAt > 0 {
+			resets = time.Unix(w.ResetsAt, 0).UTC().Format(time.RFC3339)
+		}
+		u.Windows = append(u.Windows, usageWindow{Label: label, Percent: w.UsedPercent, ResetsAt: resets})
+	}
+	add(last.rl.Primary)
+	add(last.rl.Secondary)
+	if last.ts != "" {
+		u.Note = "по данным прогона " + last.ts
+	}
+	return u, true
 }
 
 // --- прогоны ---
