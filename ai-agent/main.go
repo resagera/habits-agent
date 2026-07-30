@@ -11,6 +11,8 @@
 //   ← hello {dirs, version}                — первый кадр после подключения
 //   → {kind:"check", id, tool}             — проверить инструмент
 //   ← {kind:"resp", id, ok, result}        — {installed, authorized, version, error}
+//   → {kind:"sessions", id, tool}          — список прошлых сессий CLI
+//   → {kind:"session", id, tool, session_id} — содержимое одной сессии
 //   → {kind:"run", run_id, tool, workdir, model, params, prompt, session_id}
 //   ← {kind:"run_status", run_id, status:"running"}
 //   ← {kind:"run_result", run_id, ok, output, error, session_id, meta}
@@ -26,6 +28,7 @@
 //	AI_AGENT_BYPASS    1 (по умолчанию) — --dangerously-skip-permissions
 //	AI_AGENT_CLAUDE    путь к бинарнику claude (по умолчанию из PATH)
 //	AI_AGENT_TIMEOUT   таймаут одного прогона в минутах (по умолчанию 60)
+//	AI_AGENT_CACHE     файл кэша индекса сессий (по умолчанию в ~/.cache)
 package main
 
 import (
@@ -47,7 +50,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const agentVersion = "1.4.0"
+const agentVersion = "1.5.0"
 
 var httpClient = &http.Client{Timeout: 20 * time.Second}
 
@@ -178,6 +181,7 @@ func main() {
 	log.Printf("bypass=%v timeout=%s", bypass, runTimeout)
 
 	go flusher()
+	go warmSessions() // индекс прошлых сессий: первый запрос из UI — уже по кэшу
 
 	backoff := time.Second
 	for {
@@ -280,6 +284,14 @@ func (c *conn) loop() error {
 			go func(f frame) {
 				res := toolUsage(f.Tool)
 				_ = c.send(frame{Kind: "resp", ID: f.ID, OK: true, Result: res})
+			}(f)
+		case "sessions": // список прошлых сессий инструмента
+			go func(f frame) {
+				_ = c.send(frame{Kind: "resp", ID: f.ID, OK: true, Result: listSessions(f.Tool)})
+			}(f)
+		case "session": // содержимое одной сессии
+			go func(f frame) {
+				_ = c.send(frame{Kind: "resp", ID: f.ID, OK: true, Result: readSession(f.Tool, f.SessionID)})
 			}(f)
 		case "run":
 			runsMu.Lock()
@@ -696,7 +708,7 @@ func toolSummary(input json.RawMessage) string {
 	if json.Unmarshal(input, &m) != nil {
 		return ""
 	}
-	for _, k := range []string{"command", "file_path", "path", "pattern", "url", "prompt", "description", "query"} {
+	for _, k := range []string{"command", "cmd", "file_path", "path", "pattern", "url", "prompt", "description", "query"} {
 		if v, ok := m[k].(string); ok && v != "" {
 			return truncate(strings.Join(strings.Fields(v), " "), 140)
 		}
