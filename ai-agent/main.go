@@ -40,17 +40,19 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-const agentVersion = "1.5.0"
+const agentVersion = "1.6.0"
 
 var httpClient = &http.Client{Timeout: 20 * time.Second}
 
@@ -81,6 +83,10 @@ type frame struct {
 type hello struct {
 	Dirs    []string `json:"dirs"`
 	Version string   `json:"version"`
+	// Active — прогоны, живые В ЭТОМ процессе агента (выполняются или ждут
+	// доставки результата). Сервер по этому списку закрывает «осиротевшие»:
+	// те, что числятся running, но агента с ними уже нет (перезапуск/падение).
+	Active []int64 `json:"active"`
 }
 
 var (
@@ -110,6 +116,60 @@ var (
 	canceled = map[int64]bool{}
 	killers  = map[int64]func(){} // runID -> отмена контекста процесса
 )
+
+// acceptedRunIDs — прогоны, принятые этим процессом и ещё не подтверждённые
+// сервером (в работе либо с результатом на доставке).
+func acceptedRunIDs() []int64 {
+	runsMu.Lock()
+	ids := make([]int64, 0, len(accepted))
+	for id := range accepted {
+		ids = append(ids, id)
+	}
+	runsMu.Unlock()
+	return ids
+}
+
+// inflightRunIDs — принятые прогоны, по которым результата ЕЩЁ НЕТ: именно они
+// пропадут при остановке процесса, о них нужно отчитаться перед выходом.
+func inflightRunIDs() []int64 {
+	runsMu.Lock()
+	ids := make([]int64, 0, len(accepted))
+	for id := range accepted {
+		ids = append(ids, id)
+	}
+	runsMu.Unlock()
+	resultsMu.Lock()
+	out := ids[:0]
+	for _, id := range ids {
+		if _, done := results[id]; !done {
+			out = append(out, id)
+		}
+	}
+	resultsMu.Unlock()
+	return out
+}
+
+// handleShutdown: по SIGTERM (в т.ч. systemctl restart — например, когда сама
+// AI-задача обновляет агента) сообщаем серверу о прерванных прогонах, иначе
+// они висели бы в «выполняется» до реапера.
+func handleShutdown() {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM, syscall.SIGINT)
+	<-ch
+	ids := inflightRunIDs()
+	if len(ids) > 0 {
+		log.Printf("shutdown: сообщаю о прерванных прогонах: %v", ids)
+		for _, id := range ids {
+			_ = sendCurrent(frame{
+				Kind: "run_result", RunID: id, OK: false,
+				Error: "прогон прерван: агент остановлен (перезапуск или обновление агента)",
+			})
+		}
+		time.Sleep(500 * time.Millisecond) // дать кадрам уйти в сеть
+	}
+	log.Printf("shutdown")
+	os.Exit(0)
+}
 
 // sendCurrent шлёт кадр через актуальное соединение (если оно есть).
 func sendCurrent(f frame) error {
@@ -181,6 +241,7 @@ func main() {
 	log.Printf("bypass=%v timeout=%s", bypass, runTimeout)
 
 	go flusher()
+	go handleShutdown()
 	go warmSessions() // индекс прошлых сессий: первый запрос из UI — уже по кэшу
 
 	backoff := time.Second
@@ -236,7 +297,7 @@ func connect(wsURL, token string) error {
 
 func (c *conn) loop() error {
 	// hello: разрешённые папки + версия агента
-	hb, _ := json.Marshal(hello{Dirs: dirs, Version: agentVersion})
+	hb, _ := json.Marshal(hello{Dirs: dirs, Version: agentVersion, Active: acceptedRunIDs()})
 	c.writeMu.Lock()
 	c.ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	err := c.ws.WriteMessage(websocket.TextMessage, hb)
