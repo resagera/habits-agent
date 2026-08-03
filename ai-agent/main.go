@@ -26,7 +26,8 @@
 //	AI_AGENT_TOKEN     токен машины (выдаётся в UI при добавлении)
 //	AI_AGENT_DIRS      разрешённые папки через ';'
 //	AI_AGENT_BYPASS    1 (по умолчанию) — --dangerously-skip-permissions
-//	AI_AGENT_CLAUDE    путь к бинарнику claude (по умолчанию из PATH)
+//	AI_AGENT_CLAUDE    путь к бинарнику claude (по умолчанию ищем сами, см. binpath.go)
+//	AI_AGENT_CODEX     путь к бинарнику codex (то же)
 //	AI_AGENT_TIMEOUT   таймаут одного прогона в минутах (по умолчанию 60)
 //	AI_AGENT_CACHE     файл кэша индекса сессий (по умолчанию в ~/.cache)
 package main
@@ -52,7 +53,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const agentVersion = "1.6.0"
+const agentVersion = "1.7.0"
 
 var httpClient = &http.Client{Timeout: 20 * time.Second}
 
@@ -229,9 +230,6 @@ func main() {
 	if os.Getenv("AI_AGENT_BYPASS") == "0" {
 		bypass = false
 	}
-	if v := os.Getenv("AI_AGENT_CLAUDE"); v != "" {
-		claudeBin = v
-	}
 	if v, err := strconv.Atoi(os.Getenv("AI_AGENT_TIMEOUT")); err == nil && v > 0 {
 		runTimeout = time.Duration(v) * time.Minute
 	}
@@ -394,6 +392,7 @@ type toolStatus struct {
 	Installed  bool   `json:"installed"`
 	Authorized bool   `json:"authorized"`
 	Version    string `json:"version"`
+	Path       string `json:"path,omitempty"` // где нашли бинарник (диагностика PATH)
 	Error      string `json:"error,omitempty"`
 	CheckedAt  int64  `json:"checked_at"`
 }
@@ -415,21 +414,22 @@ func checkTool(tool string) json.RawMessage {
 
 func checkClaude() toolStatus {
 	st := toolStatus{}
-	bin, err := exec.LookPath(claudeBin)
+	bin, err := toolPath(claudeBin)
 	if err != nil {
-		st.Error = "claude не найден в PATH — установите Claude Code"
+		st.Error = "Claude Code не установлен? " + err.Error()
 		return st
 	}
 	st.Installed = true
+	st.Path = bin
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if out, err := exec.CommandContext(ctx, bin, "--version").Output(); err == nil {
+	if out, err := toolCmd(ctx, bin, "--version").Output(); err == nil {
 		st.Version = strings.TrimSpace(string(out))
 	}
 	// авторизация: реальный мини-запрос (haiku) — единственный надёжный способ
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 75*time.Second)
 	defer cancel2()
-	cmd := exec.CommandContext(ctx2, bin, "-p", "--model", "haiku", "--output-format", "json")
+	cmd := toolCmd(ctx2, bin, "-p", "--model", "haiku", "--output-format", "json")
 	cmd.Dir = dirs[0]
 	cmd.Stdin = strings.NewReader("Reply with exactly: ok")
 	out, err := cmd.Output()
@@ -451,22 +451,23 @@ func checkClaude() toolStatus {
 
 func checkCodex() toolStatus {
 	st := toolStatus{}
-	bin, err := exec.LookPath("codex")
+	bin, err := toolPath("codex")
 	if err != nil {
-		st.Error = "codex не найден в PATH — установите Codex CLI"
+		st.Error = "Codex CLI не установлен? " + err.Error()
 		return st
 	}
 	st.Installed = true
+	st.Path = bin
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if out, err := exec.CommandContext(ctx, bin, "--version").Output(); err == nil {
+	if out, err := toolCmd(ctx, bin, "--version").Output(); err == nil {
 		st.Version = strings.TrimSpace(string(out))
 	}
 	// авторизация: реальный мини-запрос (как у claude) — единственный
 	// надёжный способ; --ephemeral, чтобы не плодить сессии
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 75*time.Second)
 	defer cancel2()
-	cmd := exec.CommandContext(ctx2, bin, "exec", "--json", "--skip-git-repo-check", "--ephemeral", "-")
+	cmd := toolCmd(ctx2, bin, "exec", "--json", "--skip-git-repo-check", "--ephemeral", "-")
 	cmd.Dir = dirs[0]
 	cmd.Stdin = strings.NewReader("Reply with exactly: ok")
 	out, err := cmd.Output()
@@ -582,8 +583,8 @@ func usageClaude() usageInfo {
 	// план подписки — из claude auth status
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel2()
-	if bin, err := exec.LookPath(claudeBin); err == nil {
-		if out, err := exec.CommandContext(ctx2, bin, "auth", "status", "--json").Output(); err == nil {
+	if bin, err := toolPath(claudeBin); err == nil {
+		if out, err := toolCmd(ctx2, bin, "auth", "status", "--json").Output(); err == nil {
 			var st struct {
 				SubscriptionType string `json:"subscriptionType"`
 			}
@@ -778,9 +779,9 @@ func toolSummary(input json.RawMessage) string {
 }
 
 func executeClaude(f frame) frame {
-	bin, err := exec.LookPath(claudeBin)
+	bin, err := toolPath(claudeBin)
 	if err != nil {
-		return frame{OK: false, Error: "claude не найден в PATH"}
+		return frame{OK: false, Error: err.Error()}
 	}
 
 	// stream-json (+обязательный --verbose) — события хода выполнения на лету
@@ -803,7 +804,7 @@ func executeClaude(f frame) frame {
 	defer cancel()
 	registerKiller(f.RunID, cancel)
 	defer unregisterKiller(f.RunID)
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := toolCmd(ctx, bin, args...)
 	cmd.Dir = f.Workdir
 	cmd.Stdin = strings.NewReader(f.Prompt)
 	var stderr bytes.Buffer
@@ -920,9 +921,9 @@ func executeClaude(f frame) frame {
 // Контекст задачи: thread_id из события thread.started, продолжение —
 // `codex exec resume <id>`. Модель по умолчанию — из config.toml машины.
 func executeCodex(f frame) frame {
-	bin, err := exec.LookPath("codex")
+	bin, err := toolPath("codex")
 	if err != nil {
-		return frame{OK: false, Error: "codex не найден в PATH"}
+		return frame{OK: false, Error: err.Error()}
 	}
 
 	args := []string{"exec"}
@@ -949,7 +950,7 @@ func executeCodex(f frame) frame {
 	defer cancel()
 	registerKiller(f.RunID, cancel)
 	defer unregisterKiller(f.RunID)
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := toolCmd(ctx, bin, args...)
 	cmd.Dir = f.Workdir
 	cmd.Stdin = strings.NewReader(f.Prompt)
 	var stderr bytes.Buffer
